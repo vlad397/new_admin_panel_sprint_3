@@ -57,12 +57,12 @@ services:
   
   etl:
     build:
-      context: ../01_etl
+      context: ../03_etl
       dockerfile: Dockerfile
     restart: always
     depends_on:
       - db
     env_file:
-      - ../01_etl/.env
+      - ../03_etl/.env
 
 
