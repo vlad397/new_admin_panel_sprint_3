@@ -95,6 +95,7 @@ def etl_part1(
             for films in range(0, len(films_ids), 10):
                 pg_cursor.execute(make_query("WHERE fw.id IN {0}".format(
                     tuple(films_ids[films:films + 10]))))
+                # Тут можно использовать fetchall(), т.к. цикл по 10 объектов
                 etl_part2(pg_cursor.fetchall(), es)
 
             r.set(name=state, value=dt.datetime.utcnow().isoformat())
