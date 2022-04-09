@@ -81,6 +81,7 @@ def etl_part1(
     for state, date in states.items():
         if state == 'genre' or state == 'person':
             films_ids = []
+            # Берем все id фильмов, где изменился жанр или человек пачками
             pg_cursor.execute(make_prequery(state, date))
             while True:
                 rows = pg_cursor.fetchmany(100)
@@ -90,6 +91,7 @@ def etl_part1(
                 else:
                     break
 
+            # По id фильмов берем полную информацию для отправки пачками
             for films in range(0, len(films_ids), 10):
                 pg_cursor.execute(make_query("WHERE fw.id IN {0}".format(
                     tuple(films_ids[films:films + 10]))))
@@ -99,6 +101,7 @@ def etl_part1(
 
         elif state == 'film_work':
             all_films = []
+            # Берем все обновленные фильмы пачками
             pg_cursor.execute(make_query("WHERE fw.updated_at > '{0}'".format(
                 date)))
             while True:
@@ -109,6 +112,7 @@ def etl_part1(
                 else:
                     break
 
+            # Отправляем данные на отправку пачками
             for films in range(0, len(all_films), 10):
                 etl_part2(tuple(all_films[films:films + 10]), es)
             r.set(name=state, value=dt.datetime.utcnow().isoformat())
