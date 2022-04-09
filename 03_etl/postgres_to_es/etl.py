@@ -9,15 +9,48 @@ import backoff
 import elasticsearch
 import psycopg2
 import redis
-from dotenv import load_dotenv
 from psycopg2.extensions import connection as _connection
 from psycopg2.extras import DictCursor
-
-load_dotenv()
+from elasticsearch import helpers
+from queries import make_query, make_prequery
 
 
 @backoff.on_exception(backoff.expo, BaseException)
-def etl(pg_conn: _connection, es: elasticsearch.client.Elasticsearch) -> None:
+def etl_part2(
+        pg_objects: tuple, es: elasticsearch.client.Elasticsearch) -> None:
+
+    data_to_load = []
+
+    for data in pg_objects:
+        # Подготовка объекта в ElasticSearch
+        object = {
+            'id': data['id'],
+            'imdb_rating': data['rating'],
+            'genre': data['genres'],
+            'title': data['title'],
+            'description': data['description'],
+            'director': data['directors'],
+            'actors_names': data['actors_names'],
+            'writers_names': data['writers_names'],
+            'actors': data['actors'],
+            'writers': data['writers']
+        }
+        data_to_load.append(object)
+
+    def gendata():
+        for doc in data_to_load:
+            record = {'_id': doc['id'],
+                      '_op_type': 'index',
+                      '_index': 'movies',
+                      **doc}
+            yield record
+    # Отправка пачки объектов в ElasticSearch
+    helpers.bulk(es, gendata())
+
+
+@backoff.on_exception(backoff.expo, BaseException)
+def etl_part1(
+        pg_conn: _connection, es: elasticsearch.client.Elasticsearch) -> None:
     """Считывание состояния последнего обновления в хранилище
        Детектирование более новых записей в БД относительно состояния
        Обновление соответствующих записей в ElasticSearch"""
@@ -28,90 +61,57 @@ def etl(pg_conn: _connection, es: elasticsearch.client.Elasticsearch) -> None:
                     port=os.environ.get('REDIS_PORT'))
     if not r.exists('film_work') == 1:
         r.set(name='film_work', value=dt.datetime.min.isoformat())
-    state = dt.datetime.fromisoformat(r.get('film_work').decode("utf-8"))
+    if not r.exists('person') == 1:
+        r.set(name='person', value=dt.datetime.min.isoformat())
+    if not r.exists('genre') == 1:
+        r.set(name='genre', value=dt.datetime.min.isoformat())
+
+    state_fw = dt.datetime.fromisoformat(r.get('film_work').decode("utf-8"))
+    state_g = dt.datetime.fromisoformat(r.get('genre').decode("utf-8"))
+    state_p = dt.datetime.fromisoformat(r.get('person').decode("utf-8"))
+
+    states = {
+        'film_work': state_fw,
+        'genre': state_g,
+        'person': state_p}
 
     # Подключение к БД, обнаружение обновленных относительно состояния записей
     pg_cursor = pg_conn.cursor()
-    pg_cursor.execute("SELECT * FROM content.film_work WHERE "
-                      "updated_at > '{0}'".format(state))
-    pg_objects = pg_cursor.fetchall()
 
-    if pg_objects:
-        for data in pg_objects:
-            id = data[2]
-            title = data[3]
-            description = data[4]
-            rating = data[7]
+    for state, date in states.items():
+        if state == 'genre' or state == 'person':
+            films_ids = []
+            pg_cursor.execute(make_prequery(state, date))
+            while True:
+                rows = pg_cursor.fetchmany(100)
+                if len(rows) > 0:
+                    for row in rows:
+                        films_ids.append(row['id'])
+                else:
+                    break
 
-            # Запрос на получение всех участвующих в определенном фильме людей
-            query_roles = (
-                "SELECT "
-                "pfw.role, "
-                "p.id, "
-                "p.full_name "
-                "FROM content.film_work fw "
-                "LEFT JOIN content.person_film_work pfw ON "
-                "pfw.film_work_id = fw.id "
-                "LEFT JOIN content.person p ON p.id = pfw.person_id "
-                "WHERE film_work_id='{0}' "
-                "ORDER BY pfw.role;".format(id))
+            for films in range(0, len(films_ids), 10):
+                pg_cursor.execute(make_query("WHERE fw.id IN {0}".format(
+                    tuple(films_ids[films:films + 10]))))
+                etl_part2(pg_cursor.fetchall(), es)
 
-            actors_names = []
-            writers_names = []
-            directors = []
-            actors = []
-            writers = []
+            r.set(name=state, value=dt.datetime.utcnow().isoformat())
 
-            pg_cursor.execute(query_roles)
-            for person in pg_cursor.fetchall():
-                if person[0] == 'actor':
-                    actors_names.append(person[2])
-                    actors.append({'id': person[1], 'name': person[2]})
-                elif person[0] == 'writer':
-                    writers_names.append(person[2])
-                    writers.append({'id': person[1], 'name': person[2]})
-                elif person[0] == 'director':
-                    directors.append(person[2])
+        elif state == 'film_work':
+            all_films = []
+            pg_cursor.execute(make_query("WHERE fw.updated_at > '{0}'".format(
+                date)))
+            while True:
+                rows = pg_cursor.fetchmany(100)
+                if len(rows) > 0:
+                    for row in rows:
+                        all_films.append(row)
+                else:
+                    break
 
-            # Запрос на получение всех жанров определенного фильма
-            query_genres = (
-                "SELECT "
-                "g.name "
-                "FROM content.film_work fw "
-                "LEFT JOIN content.genre_film_work gfw ON "
-                "gfw.film_work_id = fw.id "
-                "LEFT JOIN content.genre g ON g.id = gfw.genre_id "
-                "WHERE film_work_id='{0}';".format(id))
-
-            genres = []
-
-            pg_cursor.execute(query_genres)
-            for genre in pg_cursor.fetchall():
-                genres.append(genre[0])
-
-            # Подготовка и отправка объекта в ElasticSearch
-            object = {
-                'id': id,
-                'imdb_rating': rating,
-                'genre': genres,
-                'title': title,
-                'description': description,
-                'director': directors,
-                'actors_names': actors_names,
-                'writers_names': writers_names,
-                'actors': actors,
-                'writers': writers
-            }
-
-            es.index(index='movies', id=object['id'], body=object)
-            logging.info(
-                'Изменения для <{0}> перенесены в ElasticSearch'.format(
-                    object['title']))
-    else:
-        logging.info('Изменений не обнаружено')
-
-    # Обновление состояния в хранилище
-    r.set(name='film_work', value=dt.datetime.utcnow().isoformat())
+            for films in range(0, len(all_films), 10):
+                etl_part2(tuple(all_films[films:films + 10]), es)
+            r.set(name=state, value=dt.datetime.utcnow().isoformat())
 
 
 @backoff.on_exception(backoff.expo, BaseException)
@@ -130,7 +130,7 @@ def try_connect(dsl: dict, es_dsl: dict) -> None:
 
     with pg_context(dsl) as pg_conn, pg_conn:
         logging.info('Подключение к БД выполнено')
-        etl(pg_conn, es)
+        etl_part1(pg_conn, es)
 
 
 if __name__ == '__main__':
